@@ -1,6 +1,33 @@
-import OTProcessor from './OTProcessor';
+import OTProcessor, {
+  contextGateCoverage,
+  chainingGateCoverage,
+} from './OTProcessor';
 
 export default class GPOSProcessor extends OTProcessor {
+  // The coverage the current glyph must be in for applyLookup to match, per
+  // lookup type. Every subtable's first test, so a glyph outside all of them
+  // cannot match and can skip the subtable scan (see buildLookupGate).
+  gateCoverage(lookupType, table) {
+    switch (lookupType) {
+      case 4: // Mark-to-base
+        return table.markCoverage;
+      case 5: // Mark-to-ligature
+        return table.markCoverage;
+      case 6: // Mark-to-mark
+        return table.mark1Coverage;
+      case 7: // Contextual positioning
+        return contextGateCoverage(table);
+      case 8: // Chaining contextual positioning
+        return chainingGateCoverage(table);
+      case 9: // Extension positioning; the wrapper holds the real table
+        return this.gateCoverage(table.lookupType, table.extension);
+      default:
+        // Single, pair and cursive positioning each begin with the plain
+        // coverage table.
+        return table.coverage;
+    }
+  }
+
   applyPositionValue(sequenceIndex, value) {
     let position = this.positions[this.glyphIterator.peekIndex(sequenceIndex)];
     if (value.xAdvance != null) {

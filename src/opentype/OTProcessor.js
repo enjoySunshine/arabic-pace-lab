@@ -3,6 +3,79 @@ import * as Script from '../layout/Script';
 
 const DEFAULT_SCRIPTS = ['DFLT', 'dflt', 'latn'];
 
+// Above this many coverage entries in one lookup, its gate is skipped and the
+// lookup is applied the old way, subtable by subtable. This bounds the memory
+// a single huge coverage table can claim for the gate.
+const MAX_GATE_ENTRIES = 16384;
+
+// Per-lookup subtable gates, keyed by the decoded lookup object that the font
+// caches for its lifetime. A WeakMap so a dropped font releases them.
+let subtableGates = new WeakMap();
+
+function forEachCoverageGlyph(coverage, fn) {
+  if (coverage.version === 1) {
+    for (let i = 0; i < coverage.glyphs.length; i++) {
+      fn(coverage.glyphs[i]);
+    }
+  } else {
+    for (let range of coverage.rangeRecords) {
+      for (let glyph = range.start; glyph <= range.end; glyph++) {
+        fn(glyph);
+      }
+    }
+  }
+}
+
+function coverageSize(coverage) {
+  if (coverage.version === 1) {
+    return coverage.glyphs.length;
+  }
+
+  let size = 0;
+  for (let range of coverage.rangeRecords) {
+    size += range.end - range.start + 1;
+  }
+
+  return size;
+}
+
+export function contextGateCoverage(table) {
+  return table.version === 3 ? table.coverages[0] : table.coverage;
+}
+
+export function chainingGateCoverage(table) {
+  return table.version === 3 ? table.inputCoverage[0] : table.coverage;
+}
+
+// Builds the exact set of glyph ids that can begin a match in this lookup by
+// unioning each subtable's gate coverage. Every subtable first tests that one
+// coverage table against the current glyph and returns without matching when
+// it fails, so a glyph outside the union cannot match any subtable and
+// skipping it cannot change the shaping result.
+//
+// Returns null when the union is unknown or larger than MAX_GATE_ENTRIES, in
+// which case the lookup is applied the old way, subtable by subtable.
+function buildLookupGate(lookup, gateCoverage) {
+  let glyphs = new Set();
+  let total = 0;
+
+  for (let table of lookup.subTables) {
+    let coverage = gateCoverage(lookup.lookupType, table);
+    if (!coverage) {
+      return null;
+    }
+
+    total += coverageSize(coverage);
+    if (total > MAX_GATE_ENTRIES) {
+      return null;
+    }
+
+    forEachCoverageGlyph(coverage, (glyph) => glyphs.add(glyph));
+  }
+
+  return glyphs;
+}
+
 export default class OTProcessor {
   constructor(font, table) {
     this.font = font;
@@ -213,6 +286,7 @@ export default class OTProcessor {
 
       let direction = this.isReverseLookup(lookup) ? -1 : 1;
       let startIndex = direction === -1 ? glyphs.length - 1 : 0;
+      let gate = this.getSubtableGate(lookup);
 
       this.glyphIterator.reset(
         lookup.flags,
@@ -224,7 +298,11 @@ export default class OTProcessor {
         this.glyphIterator.index >= 0 &&
         this.glyphIterator.index < glyphs.length
       ) {
-        if (feature in this.glyphIterator.cur.features) {
+        let glyph = this.glyphIterator.cur;
+        if (
+          feature in glyph.features &&
+          (gate === null || gate.has(glyph.id))
+        ) {
           for (let table of lookup.subTables) {
             if (this.applyLookup(lookup.lookupType, table)) {
               break;
@@ -240,6 +318,29 @@ export default class OTProcessor {
   // before the continuation position: applyLookups calls next() after the lookup.
   // Contextual lookups reset the cursor and flags before each nested lookup and
   // determine their own continuation after the matched input sequence.
+  // Builds (once per lookup) the exact set of glyph ids that can begin a match
+  // in this lookup, so that glyphs outside it skip the subtable scan entirely.
+  // See buildLookupGate for why this cannot change the shaping result.
+  getSubtableGate(lookup) {
+    let gate = subtableGates.get(lookup);
+    if (gate === undefined) {
+      gate = buildLookupGate(lookup, (type, table) =>
+        this.gateCoverage(type, table),
+      );
+      subtableGates.set(lookup, gate);
+    }
+
+    return gate;
+  }
+
+  // The coverage table that must contain the current glyph for an applyLookup
+  // of this lookup type to match, or null when applyLookup tests none first.
+  // GSUB and GPOS assign different meanings to the same lookup type numbers,
+  // so each processor implements its own.
+  gateCoverage() {
+    return null;
+  }
+
   applyLookup(lookup, table) {
     throw new Error('applyLookup must be implemented by subclasses');
   }

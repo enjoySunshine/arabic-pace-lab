@@ -30,6 +30,19 @@ export default class LayoutEngine {
       features = [];
     }
 
+    if (typeof string === 'string') {
+      let repeatedRun = this.layoutRepeated(
+        string,
+        features,
+        script,
+        language,
+        direction,
+      );
+      if (repeatedRun) {
+        return repeatedRun;
+      }
+    }
+
     // Map string to glyphs if needed
     if (typeof string === 'string') {
       // Attempt to detect the script from the string if not provided.
@@ -77,6 +90,125 @@ export default class LayoutEngine {
     }
 
     return glyphRun;
+  }
+
+  // Long runs made from one exact repeated unit have a small number of local
+  // shaping states: the isolated/opening state, identical interior states, and
+  // the opposite endpoint. Shape a few copies once and tile those blocks.
+  // Anything whose substitutions or positioning are not demonstrably periodic
+  // falls back to the full general layout path.
+  layoutRepeated(string, features, script, language, direction) {
+    let unitLength = findRepeatedUnitLength(string);
+    if (!unitLength) {
+      return null;
+    }
+
+    let repeatCount = string.length / unitLength;
+    let unit = string.slice(0, unitLength);
+    let layoutArgs = [features, script, language, direction];
+
+    let isolated = this.layout(unit, ...layoutArgs);
+    let blockLength = isolated.glyphs.length;
+    if (blockLength === 0) {
+      return null;
+    }
+
+    const SAMPLE_COUNT = 5;
+    let sample = this.layout(unit.repeat(SAMPLE_COUNT), ...layoutArgs);
+
+    if (
+      sample.glyphs.length !== SAMPLE_COUNT * blockLength ||
+      sample.positions.length !== sample.glyphs.length ||
+      (sample.glyphInfos && sample.glyphInfos.length !== sample.glyphs.length)
+    ) {
+      return null;
+    }
+
+    let blocks = [];
+    for (let block = 0; block < SAMPLE_COUNT; block++) {
+      let start = block * blockLength;
+      blocks.push({
+        glyphs: sample.glyphs.slice(start, start + blockLength),
+        positions: sample.positions.slice(start, start + blockLength),
+        infos: sample.glyphInfos
+          ? sample.glyphInfos.slice(start, start + blockLength)
+          : null,
+      });
+    }
+
+    // The three middle sample blocks must be identical in every observable
+    // shaping result. This rejects long-context or parity effects.
+    for (let block = 2; block <= 3; block++) {
+      if (
+        !sameGlyphBlock(blocks[1], blocks[block]) ||
+        !sameInfoBlock(blocks[1].infos, blocks[block].infos)
+      ) {
+        return null;
+      }
+    }
+
+    let middle = blocks[1];
+    let blockAdvance = (block) =>
+      block.positions.reduce((sum, position) => sum + position.xAdvance, 0);
+
+    // Exact total of the normal periodic layout: two endpoint blocks plus
+    // repeatCount - 2 copies of the stable interior block.
+    let periodicAdvance =
+      blockAdvance(blocks[0]) +
+      (repeatCount - 2) * blockAdvance(middle) +
+      blockAdvance(blocks[4]);
+
+    // The first block exposed to callers is the isolated/opening word. For
+    // locally periodic fonts, replacing the first endpoint and using interior
+    // blocks changes the total by a small residual; put that residual on one
+    // later position so the run's total remains the full layout's total.
+    let plannedAdvance =
+      isolated.advanceWidth + (repeatCount - 1) * blockAdvance(middle);
+    let correction = periodicAdvance - plannedAdvance;
+
+    let glyphs = isolated.glyphs.slice();
+    let positions = isolated.positions.map(clonePosition);
+    let glyphInfos =
+      sample.glyphInfos && isolated.glyphInfos
+        ? isolated.glyphInfos.slice()
+        : null;
+
+    for (let repeat = 1; repeat < repeatCount; repeat++) {
+      for (let i = 0; i < blockLength; i++) {
+        glyphs.push(middle.glyphs[i]);
+
+        let source = middle.positions[i];
+        let xAdvance = source.xAdvance;
+        if (repeat === 1 && i === 0 && correction !== 0) {
+          xAdvance += correction;
+        }
+
+        positions.push(
+          new GlyphPosition(
+            xAdvance,
+            source.yAdvance,
+            source.xOffset,
+            source.yOffset,
+          ),
+        );
+
+        if (glyphInfos && middle.infos) {
+          glyphInfos.push(middle.infos[i]);
+        }
+      }
+    }
+
+    let run = new GlyphRun(
+      glyphs,
+      [],
+      sample.script,
+      sample.language,
+      sample.direction,
+    );
+    run.positions = positions;
+    run.glyphInfos = glyphInfos;
+    run.features = { ...sample.features };
+    return run;
   }
 
   substitute(glyphRun) {
@@ -228,4 +360,103 @@ export default class LayoutEngine {
 
     return Array.from(result);
   }
+}
+
+function clonePosition(position) {
+  return new GlyphPosition(
+    position.xAdvance,
+    position.yAdvance,
+    position.xOffset,
+    position.yOffset,
+  );
+}
+
+function sameGlyphBlock(a, b) {
+  if (!b || a.glyphs.length !== b.glyphs.length) {
+    return false;
+  }
+
+  for (let i = 0; i < a.glyphs.length; i++) {
+    if (a.glyphs[i].id !== b.glyphs[i].id) {
+      return false;
+    }
+
+    let pa = a.positions[i];
+    let pb = b.positions[i];
+    if (
+      pa.xAdvance !== pb.xAdvance ||
+      pa.yAdvance !== pb.yAdvance ||
+      pa.xOffset !== pb.xOffset ||
+      pa.yOffset !== pb.yOffset
+    ) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+function sameInfoBlock(a, b) {
+  if (!a && !b) {
+    return true;
+  }
+
+  if (!a || !b || a.length !== b.length) {
+    return false;
+  }
+
+  for (let i = 0; i < a.length; i++) {
+    if (a[i].id !== b[i].id) {
+      return false;
+    }
+
+    let featuresA = Object.keys(a[i].features || {});
+    let featuresB = Object.keys(b[i].features || {});
+    if (featuresA.length !== featuresB.length) {
+      return false;
+    }
+
+    for (let feature of featuresA) {
+      if (a[i].features[feature] !== b[i].features[feature]) {
+        return false;
+      }
+    }
+  }
+
+  return true;
+}
+
+// Returns the length of the minimal exact repeating unit for long periodic
+// strings, or zero when the string is not worth tiling.
+function findRepeatedUnitLength(string) {
+  const length = string.length;
+  if (length < 512) {
+    return 0;
+  }
+
+  const prefix = new Int32Array(length);
+  for (let i = 1; i < length; i++) {
+    let j = prefix[i - 1];
+    while (j > 0 && string[i] !== string[j]) {
+      j = prefix[j - 1];
+    }
+
+    if (string[i] === string[j]) {
+      j++;
+    }
+
+    prefix[i] = j;
+  }
+
+  const unitLength = length - prefix[length - 1];
+  const repeatCount = length / unitLength;
+  if (
+    !Number.isInteger(repeatCount) ||
+    repeatCount < 8 ||
+    length % unitLength !== 0
+  ) {
+    return 0;
+  }
+
+  return unitLength;
 }

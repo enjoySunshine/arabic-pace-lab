@@ -1,4 +1,7 @@
-import OTProcessor from './OTProcessor';
+import OTProcessor, {
+  contextGateCoverage,
+  chainingGateCoverage,
+} from './OTProcessor';
 import GlyphInfo from './GlyphInfo';
 
 // Limit on the length of a glyph run, as in HarfBuzz, so that malicious
@@ -19,6 +22,25 @@ export default class GSUBProcessor extends OTProcessor {
   // earlier-in-text glyph
   isReverseLookup(lookup) {
     return lookup.lookupType === 8;
+  }
+
+  // The coverage the current glyph must be in for applyLookup to match, per
+  // lookup type. Every subtable's first test, so a glyph outside all of them
+  // cannot match and can skip the subtable scan (see buildLookupGate).
+  gateCoverage(lookupType, table) {
+    switch (lookupType) {
+      case 5: // Contextual substitution
+        return contextGateCoverage(table);
+      case 6: // Chaining contextual substitution
+      case 8: // Reverse chaining contextual single substitution
+        return chainingGateCoverage(table);
+      case 7: // Extension substitution; the wrapper holds the real table
+        return this.gateCoverage(table.lookupType, table.extension);
+      default:
+        // Single, multiple, alternate and ligature substitution all begin
+        // with the same plain coverage table.
+        return table.coverage;
+    }
   }
 
   applyLookup(lookupType, table) {
